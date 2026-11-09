@@ -2,7 +2,7 @@ PYTHON ?= python3
 CC = clang
 BUILD_DIR = build
 
-.PHONY: all test verify-game clean
+.PHONY: all test verify-game verify-installation clean
 
 all: pixel_events.bin
 
@@ -23,6 +23,11 @@ test: all $(BUILD_DIR)/pixel_events_test
 verify-game:
 	@test -n "$(GAME_EXECUTABLE)" || { echo 'Set GAME_EXECUTABLE to the original, unpatched game executable.' >&2; exit 1; }
 	$(PYTHON) tests/check_game_dispatch.py "$(GAME_EXECUTABLE)"
+
+# Uses only a disposable copy of the supplied original game files.
+verify-installation: all
+	@test -n "$(ORIGINAL_FILES)" || { echo 'Set ORIGINAL_FILES to the original backup directory containing Contents/.' >&2; exit 1; }
+	$(PYTHON) tests/check_installation.py "$(ORIGINAL_FILES)"
 
 clean:
 	rm -f pixel_events.bin display_probe libPlanetfallDisplayTrace.dylib

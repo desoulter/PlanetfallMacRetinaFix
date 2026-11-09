@@ -7,7 +7,7 @@ import struct
 import subprocess
 import tempfile
 
-from retina_fix import PIXEL_CODE_SHA256, PIXEL_CODE_SIZE
+from retina_fix import CONFIG_MAGIC, CONFIG_OFFSET, PIXEL_CODE_OFFSET, PIXEL_CODE_SHA256, PIXEL_CODE_SIZE
 
 BASE = 0x100007000
 SYMBOLS = {
@@ -17,6 +17,11 @@ SYMBOLS = {
     "_pf_window": 0x1015AED70,
     "_pf_fullscreen": 0x1015AED9C,
     "_pf_application": 0x1015AED28,
+    "_pf_config": 0x100007D00,
+    "_pf_present_state": 0x1015AF400,
+    "_pf_clock_gettime": 0x100F68944,
+    "_pf_usleep": 0x100F68E96,
+    "_pf_vk_present": 0x100F690DC,
 }
 
 
@@ -62,7 +67,10 @@ def assemble():
         addend = struct.unpack_from("<i", code, where)[0]
         target = SYMBOLS[names[symbol]]
         struct.pack_into("<i", code, where, target + addend - (BASE + where + 4))
-    return bytes(code)
+    config_start = CONFIG_OFFSET - PIXEL_CODE_OFFSET
+    if len(code) > config_start:
+        raise RuntimeError("Wrapper code overlaps its configuration block")
+    return bytes(code).ljust(config_start, b"\0") + CONFIG_MAGIC + struct.pack("<IIQ", 0, 0, 0)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import struct
 import subprocess
@@ -13,7 +14,7 @@ import sys
 import tempfile
 
 APP_NAME = "Age of Wonders - Planetfall.app"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 EXE = "Contents/MacOS/Age of Wonders - Planetfall"
 PLIST = "Contents/Info.plist"
 SEAL = "Contents/_CodeSignature/CodeResources"
@@ -22,13 +23,20 @@ PATCH_OFFSET = 0xEC1324
 BEFORE = bytes.fromhex("41 b9 20 00 00 10")
 AFTER = bytes.fromhex("41 b9 20 20 00 10")
 # Keep the binary patch revision compatible with installed development builds.
-REVISION = 5
+REVISION = 6
 CURSOR_OFFSET = 0xEC175B
 CURSOR_BEFORE = bytes.fromhex("48 0f 4f c1")
 CURSOR_AFTER = bytes.fromhex("90 90 90 90")
 PIXEL_CODE_OFFSET = 0x7000
-PIXEL_CODE_SIZE = 418
-PIXEL_CODE_SHA256 = "73362c4967d14ddbcc7b11c58b113a4d262a46f28653d605c0968f925f8e405c"
+CONFIG_OFFSET = 0x7D00
+CONFIG_MAGIC = b"PFCONF11"
+PIXEL_CODE_SIZE = CONFIG_OFFSET - PIXEL_CODE_OFFSET + 24
+PIXEL_CODE_SHA256 = "ba505e076f88073f76ab6bf5ca6b8d55162c59c0d893603173a2ebedb9a34ca4"
+PRESENT_CALL_OFFSET = 0x437435
+PRESENT_CODE_OFFSET = 0x7400
+PRESENT_STATE_ADDRESS = 0x1015AF400
+PRESENT_CALL_BEFORE = b"\xe8" + struct.pack("<i", 0xF690DC - (PRESENT_CALL_OFFSET + 5))
+PRESENT_CALL_AFTER = b"\xe8" + struct.pack("<i", PRESENT_CODE_OFFSET - (PRESENT_CALL_OFFSET + 5))
 POLL_CALL_OFFSETS = (0xEC18E4, 0xEC1AD9)
 POLL_PATCHES = tuple(
     (offset,
@@ -39,12 +47,88 @@ POLL_PATCHES = tuple(
 FILES = (EXE, PLIST, SEAL)
 
 
+def resolution_arg(value):
+    if value.lower() in ("desktop", "auto"):
+        return None
+    match = re.fullmatch(r"(\d+)[xX](\d+)", value)
+    if not match:
+        raise argparse.ArgumentTypeError("Use desktop or WIDTHxHEIGHT, for example 2048x1280.")
+    width, height = map(int, match.groups())
+    if not (640 <= width <= 8192 and 480 <= height <= 8192):
+        raise argparse.ArgumentTypeError("Resolution must be between 640x480 and 8192x8192.")
+    return [width, height]
+
+
+def fps_arg(value):
+    try:
+        fps = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("FPS cap must be an integer from 0 to 1000.") from error
+    if not 0 <= fps <= 1000:
+        raise argparse.ArgumentTypeError("Use 0 to disable the cap, or 1 to 1000 FPS.")
+    return fps
+
+
+def settings_for(manifest, resolution=None, fps_cap=None, set_resolution=False):
+    settings = dict(manifest.get("settings", {"resolution": None, "fps_cap": 0}))
+    if set_resolution:
+        settings["resolution"] = resolution
+    if fps_cap is not None:
+        settings["fps_cap"] = fps_cap
+    # Validate saved values too; never inject corrupt or excessive intervals.
+    size = settings["resolution"]
+    if size is not None:
+        if not isinstance(size, list) or len(size) != 2 or any(type(x) is not int for x in size):
+            raise RuntimeError("Invalid saved render resolution.")
+        try:
+            resolution_arg(f"{size[0]}x{size[1]}")
+        except argparse.ArgumentTypeError as error:
+            raise RuntimeError("Invalid saved render resolution.") from error
+    fps = settings["fps_cap"]
+    if type(fps) is not int or not 0 <= fps <= 1000:
+        raise RuntimeError("Invalid saved FPS cap.")
+    return settings
+
+
+def configured_code(settings):
+    code = bytearray(pixel_code())
+    width, height = settings["resolution"] or (0, 0)
+    fps = settings["fps_cap"]
+    interval = (1000000000 + fps - 1) // fps if fps else 0
+    struct.pack_into("<IIQ", code, CONFIG_OFFSET - PIXEL_CODE_OFFSET + 8, width, height, interval)
+    return bytes(code)
+
+
+def verify_present_state(binary):
+    """Require zero-filled RW segment padding outside every declared section."""
+    offset = 32
+    for _ in range(struct.unpack_from("<I", binary, 16)[0]):
+        command, size = struct.unpack_from("<II", binary, offset)
+        if command == 0x19 and binary[offset + 8:offset + 24].rstrip(b"\0") == b"__DATA":
+            address, length, file_offset, file_size = struct.unpack_from("<QQQQ", binary, offset + 24)
+            protection, sections = struct.unpack_from("<II", binary, offset + 60)
+            end = PRESENT_STATE_ADDRESS + 8
+            if protection & 2 == 0 or not address + file_size <= PRESENT_STATE_ADDRESS < end <= address + length:
+                raise RuntimeError("Frame pacing state is not in zero-filled writable padding.")
+            for index in range(sections):
+                section = offset + 72 + index * 80
+                start, size = struct.unpack_from("<QQ", binary, section + 32)
+                if PRESENT_STATE_ADDRESS < start + size and end > start:
+                    raise RuntimeError("Frame pacing state overlaps a game section.")
+            return
+        offset += size
+    raise RuntimeError("Writable game data segment not found.")
+
+
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def pixel_code():
-    code = Path(__file__).with_name("pixel_events.bin").read_bytes()
+    path = Path(__file__).with_name("pixel_events.bin")
+    if not path.is_file():
+        raise RuntimeError("Pixel event wrapper is missing. Run make before installing.")
+    code = path.read_bytes()
     if len(code) != PIXEL_CODE_SIZE or hashlib.sha256(code).hexdigest() != PIXEL_CODE_SHA256:
         raise RuntimeError("Pixel event wrapper has an unexpected checksum. Run make to rebuild it.")
     return code
@@ -135,9 +219,15 @@ def inspect(app, backup):
         expected = m.get("installed")
         if expected and all(digest(app / r) == expected[r] for r in FILES):
             revision = m.get("patch_revision", 1)
-            release = m.get("patch_version") or (VERSION if revision == REVISION else None)
+            release = m.get("patch_version") or ({5: "1.0.0"}.get(revision)) or (VERSION if revision == REVISION else None)
             label = f"v{release}" if release else f"revision {revision}"
             print(f"Status: Retina patch {label} installed")
+            settings = settings_for(m)
+            resolution = settings["resolution"]
+            print("Fullscreen render resolution: " + (f"{resolution[0]}x{resolution[1]}" if resolution else "desktop drawable"))
+            print("FPS cap: " + (str(settings["fps_cap"]) if settings["fps_cap"] else "disabled"))
+            paced = binary[PRESENT_CALL_OFFSET:PRESENT_CALL_OFFSET + 5] == PRESENT_CALL_AFTER
+            print(f"Frame pacing hook: {'installed' if paced else 'absent'}")
         elif all(digest(app / r) == m["original"][r] for r in FILES):
             print("Status: original files; backup available")
         else:
@@ -148,17 +238,29 @@ def inspect(app, backup):
         print("Status: unsupported or modified build; installation will be refused")
 
 
-def install(app, backup, allow_update=False):
+def install(app, backup, allow_update=False, resolution=None, fps_cap=None, set_resolution=False, configure_only=False):
     ensure_not_running(app)
+    if configure_only and not (backup / "manifest.json").exists():
+        raise RuntimeError("Install the patch before using configure.")
     if (backup / "manifest.json").exists():
         manifest = read_manifest(backup, app)
+        settings = settings_for(manifest, resolution, fps_cap, set_resolution)
         expected = manifest.get("installed")
         if expected and all(digest(app / r) == expected[r] for r in FILES):
-            if manifest.get("patch_revision", 1) == REVISION:
+            if (manifest.get("patch_revision", 1) == REVISION
+                    and manifest.get("patch_payload_sha256") == PIXEL_CODE_SHA256
+                    and settings == settings_for(manifest)):
+                if manifest.get("patch_version") != VERSION:
+                    manifest["patch_version"] = VERSION
+                    write_manifest(backup, manifest)
+                    print(f"Recorded release v{VERSION}; installed game files and settings are unchanged.")
+                    return
                 print(f"Retina patch v{VERSION} is already installed.")
                 return
             if not allow_update:
-                raise RuntimeError("An older patch is installed. Run retina_fix.py update to upgrade it.")
+                raise RuntimeError("Run retina_fix.py update or configure to change an existing installation.")
+        elif configure_only:
+            raise RuntimeError("A recorded patch installation is required before using configure.")
         elif not all(digest(app / r) == manifest["original"][r] for r in FILES):
             raise RuntimeError("Game files changed since backup. Refusing to overwrite them.")
     else:
@@ -176,13 +278,17 @@ def install(app, backup, allow_update=False):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(app / relative, target)
         manifest = {"app": str(app), "original": {r: digest(backup / r) for r in FILES}}
+        settings = settings_for(manifest, resolution, fps_cap, set_resolution)
         write_manifest(backup, manifest)
     binary = bytearray((backup / EXE).read_bytes())
     if binary[PATCH_OFFSET:PATCH_OFFSET + len(BEFORE)] != BEFORE:
         raise RuntimeError("Patch instruction does not match. No game files changed.")
     if binary[CURSOR_OFFSET:CURSOR_OFFSET + len(CURSOR_BEFORE)] != CURSOR_BEFORE:
         raise RuntimeError("Cursor instruction does not match. No game files changed.")
-    wrapper = pixel_code()
+    wrapper = configured_code(settings)
+    verify_present_state(binary)
+    if binary[PRESENT_CALL_OFFSET:PRESENT_CALL_OFFSET + 5] != PRESENT_CALL_BEFORE:
+        raise RuntimeError("Presentation call does not match. No game files changed.")
     for offset, before, after in POLL_PATCHES:
         if binary[offset:offset + 5] != before:
             raise RuntimeError(f"SDL event call at {offset:#x} does not match. No game files changed.")
@@ -200,6 +306,7 @@ def install(app, backup, allow_update=False):
         binary[PIXEL_CODE_OFFSET:PIXEL_CODE_OFFSET + PIXEL_CODE_SIZE] = wrapper
         for offset, before, after in POLL_PATCHES:
             binary[offset:offset + 5] = after
+        binary[PRESENT_CALL_OFFSET:PRESENT_CALL_OFFSET + 5] = PRESENT_CALL_AFTER
         atomic_bytes(binary, app / EXE)
         original_plist = (app / PLIST).read_bytes()
         info = plistlib.loads(original_plist)
@@ -220,9 +327,13 @@ def install(app, backup, allow_update=False):
         installed = (app / EXE).read_bytes()
         if installed[PIXEL_CODE_OFFSET:PIXEL_CODE_OFFSET + PIXEL_CODE_SIZE] != wrapper or any(installed[offset:offset + 5] != after for offset, before, after in POLL_PATCHES):
             raise RuntimeError("Pixel conversion code failed verification.")
+        if installed[PRESENT_CALL_OFFSET:PRESENT_CALL_OFFSET + 5] != PRESENT_CALL_AFTER:
+            raise RuntimeError("Frame pacing call failed verification.")
         manifest["installed"] = {r: digest(app / r) for r in FILES}
         manifest["patch_revision"] = REVISION
         manifest["patch_version"] = VERSION
+        manifest["patch_payload_sha256"] = PIXEL_CODE_SHA256
+        manifest["settings"] = settings
         write_manifest(backup, manifest)
     except BaseException:
         restore_files(app, transaction)
@@ -231,7 +342,10 @@ def install(app, backup, allow_update=False):
     finally:
         shutil.rmtree(transaction)
     print(f"Retina patch v{VERSION} installed. Backup: {backup}")
-    print("Launch the game normally. Fullscreen uses the desktop drawable resolution.")
+    size = settings["resolution"]
+    print("Fullscreen render resolution: " + (f"{size[0]}x{size[1]}" if size else "desktop drawable"))
+    print("FPS cap: " + (str(settings["fps_cap"]) if settings["fps_cap"] else "disabled"))
+    print("Launch the game normally. Settings apply on its next launch.")
 
 
 def uninstall(app, backup):
@@ -253,10 +367,20 @@ def uninstall(app, backup):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    parser.add_argument("command", choices=("status", "install", "update", "uninstall"))
+    parser.add_argument("command", choices=("status", "install", "update", "configure", "uninstall"))
+    parser.add_argument("--resolution", type=resolution_arg, default=argparse.SUPPRESS,
+                        help="Fullscreen render size, e.g. 2048x1280; desktop restores native Retina size")
+    parser.add_argument("--fps-cap", type=fps_arg, default=None,
+                        help="Maximum presentation rate, 1 to 1000; 0 disables the limiter")
     parser.add_argument("--app", type=Path, help="Path to the game .app")
     parser.add_argument("--backup", type=Path, help="Backup directory (keep it until uninstalling)")
     args = parser.parse_args()
+    has_resolution = hasattr(args, "resolution")
+    has_settings = has_resolution or args.fps_cap is not None
+    if has_settings and args.command not in ("install", "update", "configure"):
+        parser.error("Render settings are accepted only by install, update, and configure.")
+    if args.command == "configure" and not has_settings:
+        parser.error("configure requires --resolution and/or --fps-cap.")
     app = args.app
     if app is None:
         candidates = [Path(__file__).resolve().parent.parent / APP_NAME,
@@ -265,10 +389,12 @@ def main():
     app = app.expanduser().resolve()
     backup = (args.backup or app.parent / "PlanetfallMacRetinaFixBackup").expanduser().resolve()
     try:
-        if args.command == "update":
-            install(app, backup, allow_update=True)
+        if args.command in ("install", "update", "configure"):
+            install(app, backup, allow_update=args.command != "install",
+                    resolution=getattr(args, "resolution", None), fps_cap=args.fps_cap,
+                    set_resolution=has_resolution, configure_only=args.command == "configure")
         else:
-            {"status": inspect, "install": install, "uninstall": uninstall}[args.command](app, backup)
+            {"status": inspect, "uninstall": uninstall}[args.command](app, backup)
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
