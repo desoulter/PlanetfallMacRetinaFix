@@ -1,0 +1,17 @@
+# Local build products and diagnostics
+*.bin
+*.o
+*.dylib
+*.log
+display_probe
+__pycache__/
+*.py[cod]
+.DS_Store
+build/
+dist/
+
+# Never publish game files, local backups, or release archives.
+*.app/
+PlanetfallMacRetinaFixBackup/
+*.zip
+*.tar.gz
