@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 — 2026-11-09
+
+- Add persistent fullscreen render resolution and FPS cap options to `install`, `update`, and the new `configure` command.
+- Preserve unspecified settings and show the active configuration in `status`.
+- Pace Vulkan presentation with monotonic deadlines and sleeping, accounting for wake-up jitter and missed frames.
+- Add configuration, frame pacing, and signed installer rollback checks.
+
+Resolution settings control the internal scene/UI frame. The desktop output mode and monitor refresh rate remain unchanged.
+
 ## 1.0.0 — 2026-11-09
 
 First release for the supported Intel GOG macOS build of Age of Wonders: Planetfall.

@@ -33,3 +33,6 @@ spec.loader.exec_module(module)
 assert set(calls) == set(module.POLL_CALL_OFFSETS), (calls, module.POLL_CALL_OFFSETS)
 assert len(calls) == 2
 print("PASS: all actual SDL_PollEvent call sites are covered:", ", ".join(hex(x) for x in calls))
+module.verify_present_state(data)
+assert data[module.PRESENT_CALL_OFFSET:module.PRESENT_CALL_OFFSET + 5] == module.PRESENT_CALL_BEFORE
+print("PASS: original presentation call and zero-filled writable pacing state padding")

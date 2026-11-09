@@ -23,21 +23,31 @@ The supported game dispatches `SDL_WINDOWEVENT_RESIZED` (5) to its resize handle
 | SDL HiDPI flag | At file offset `0xEC1324`, change `41 B9 20 00 00 10` to `41 B9 20 20 00 10`, adding `SDL_WINDOW_ALLOW_HIGHDPI`. |
 | App capability | Set `NSHighResolutionCapable=true` in `Info.plist`. |
 | Normal cursor assets | At `0xEC175B`, replace `48 0F 4F C1` with four NOPs to prevent automatic selection of 96px images instead of 32px images. |
-| Event wrapper | Redirect calls at `0xEC18E4` and `0xEC1AD9` to the 418-byte wrapper at file offset `0x7000`, in checked zero-filled executable padding. |
+| Event wrapper | Redirect calls at `0xEC18E4` and `0xEC1AD9` to the wrapper at file offset `0x7000`, in checked zero-filled executable padding. |
 | Resize handling | Convert fullscreen `RESIZED` dimensions from window coordinates to drawable pixels before the game handles the event. |
 | Mouse handling | Scale positions and motion using the actual application UI dimensions at `b688/b68c`, divided by SDL window dimensions. |
+| Presentation wrapper | Redirect the `vkQueuePresentKHR` call at `0x437435` to file offset `0x7400`; pace presentation when the configured cap is nonzero. |
+| Configuration | Store an eight-byte format marker, width, height, and frame interval in the code/configuration payload at file offset `0x7D00`. |
 
 The dispatch table at `0xEC1B40` routes resize reason 5 to `0x100EC0C2F`. The application's resize method at `0x100EBA87E` updates render and UI dimensions, and the Vulkan setter at `0x100437D56` stores the render dimensions. The frame path passes the UI dimensions to both layout and input handling.
 
 The wrapper obtains the window, fullscreen flag, and application pointer from the inspected globals. Relative references support ASLR. Zero, invalid, or excessive dimensions bypass conversion. Keyboard, text, wheel, controller, and other unrelated events pass through. Windowed resize events remain unchanged.
 
-The source payload is rebuilt by `build_pixel_events.py`. Expected SHA-256:
+The 3352-byte code/configuration template is rebuilt by `build_pixel_events.py`. Expected SHA-256 before applying local settings:
 
 ```text
-73362c4967d14ddbcc7b11c58b113a4d262a46f28653d605c0968f925f8e405c
+ba505e076f88073f76ab6bf5ca6b8d55162c59c0d893603173a2ebedb9a34ca4
 ```
 
-The installer retains internal patch revision 5 for compatibility with development installations. Public release versions are independent of that internal revision.
+v1.1.0 uses internal patch revision 6 and retains compatibility with v1.0.0/revision 5 backups. The manifest records the payload fingerprint separately from local settings, so an updated payload is installed even if the version number has not changed. Upgrading an identical development payload to the release updates the recorded version while preserving installed game bytes and settings.
+
+## Internal resolution and frame pacing
+
+A custom resolution replaces fullscreen `RESIZED` event dimensions directly. The application's render and UI frames use that size, and the original renderer composites them into the desktop-sized swapchain. The presentation surface itself stays at the desktop resolution. Mouse mapping uses the actual UI frame, including custom sizes and fractional ratios.
+
+The cap interval is `ceil(1,000,000,000 / FPS)` nanoseconds. The presentation wrapper uses the game's imported `clock_gettime` with macOS `CLOCK_MONOTONIC` (6) and `usleep`. It sleeps until a monotonic deadline, preserving the original Vulkan arguments and return value. Subsequent deadlines retain their phase across ordinary timer wake-up jitter instead of accumulating oversleep on every frame. A miss of a full additional interval resets the schedule; there is no unbounded catch-up backlog. Disabled pacing jumps directly to the original presentation import.
+
+The previous deadline lives at virtual address `0x1015AF400`, in zero-filled trailing padding of `__DATA`, beyond all declared sections and below the next segment. The installer verifies that these eight bytes are writable, zero-filled, and outside every section before applying the patch. No existing game variable, writable executable page, added Mach-O segment, or external library is used for this state.
 
 ## Fullscreen and presentation limits
 
@@ -45,11 +55,11 @@ The original game requests `SDL_WINDOW_FULLSCREEN_DESKTOP` (`0x1001`) and does n
 
 The observed desktop mode reported 120 Hz. Presentation submissions varied, with several traced intervals near 120/s. These values do not measure instantaneous adaptive display refresh. Shadow maps, texture atlases, and reduced-resolution effects have independent dimensions.
 
-Resolution selection, refresh-rate control, and frame pacing require separate work.
+Internal resolution and the FPS cap are configured by the script and applied on the next launch. Monitor mode/refresh switching and the in-game resolution menu remain unresolved.
 
 ## Checks
 
-The assembly tests cover fullscreen resize conversion, ignored size-changed events, windowed passthrough, mouse mapping to a low-resolution UI on a Retina surface, 1×/2× and fractional mapping, negative coordinates, buttons and motion, keyboard and wheel passthrough, and null/no-event handling.
+The assembly tests cover fullscreen resize conversion, configured resolution overrides, ignored size-changed events, windowed passthrough, mouse mapping to a low-resolution UI on a Retina surface, 1×/2× and fractional mapping, negative coordinates, buttons and motion, keyboard and wheel passthrough, and null/no-event handling. Presentation tests cover disabled pacing, render/present cost, non-accumulating wake-up jitter, interrupted sleep, clock failures, backwards clock movement, long pauses, and argument/result preservation.
 
 `tests/check_game_dispatch.py` inspects the original game's resize dispatch table and independently finds both direct SDL polling calls in its event-pump function. The exact injected bytes were also executed in a signed x86_64 Mach-O fixture under Rosetta during development. Installation, failed-signing rollback, idempotence, signature verification, and original-byte restoration were validated against the supported build.
 

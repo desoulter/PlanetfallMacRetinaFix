@@ -49,6 +49,22 @@ Ldimensions:
     movl %ecx, -20(%rbp)
     jmp Lvalidate
 Ldrawable:
+    movl _pf_config+8(%rip), %eax
+    movl _pf_config+12(%rip), %ecx
+    testl %eax, %eax
+    jle Lnative_drawable
+    testl %ecx, %ecx
+    jle Lnative_drawable
+    cmpl $8192, %eax
+    jg Lnative_drawable
+    cmpl $8192, %ecx
+    jg Lnative_drawable
+    // A configured resolution is the full render frame, independent of
+    // stale logical dimensions carried by queued desktop resize events.
+    movl %eax, 16(%rbx)
+    movl %ecx, 20(%rbx)
+    jmp Ldone
+Lnative_drawable:
     movq _pf_window(%rip), %rdi
     leaq -24(%rbp), %rsi
     leaq -20(%rbp), %rdx
@@ -95,3 +111,67 @@ Ldone:
     popq %rbx
     popq %rbp
     retq
+
+// Fixed entry offset keeps the patched presentation call independent of
+// instruction-size changes in the event wrapper above.
+.org 0x400, 0
+.globl _pf_present
+_pf_present:
+    cmpq $0, _pf_config+16(%rip)
+    je Lpresent_direct
+    pushq %rbp
+    movq %rsp, %rbp
+    pushq %rbx
+    subq $0x38, %rsp
+    movq %rdi, -16(%rbp)
+    movq %rsi, -24(%rbp)
+    movq _pf_config+16(%rip), %rbx
+Lclock:
+    movl $6, %edi // CLOCK_MONOTONIC on the supported macOS ABI
+    leaq -48(%rbp), %rsi
+    callq _pf_clock_gettime
+    testl %eax, %eax
+    jne Lpresent_call
+    imulq $1000000000, -48(%rbp), %rax
+    addq -40(%rbp), %rax
+    movq _pf_present_state(%rip), %rcx
+    testq %rcx, %rcx
+    je Lready
+    cmpq %rcx, %rax
+    jb Lready // reset safely if the clock moves backwards
+    addq %rbx, %rcx
+    cmpq %rcx, %rax
+    jae Ldeadline_due
+    subq %rax, %rcx
+    movq %rcx, %rax
+    // Round up to a microsecond and sleep; retry after interruptions.
+    // Fixed deadlines absorb normal wake-up jitter without accumulating it.
+    addq $999, %rax
+    xorl %edx, %edx
+    movl $1000, %ecx
+    divq %rcx
+    movl %eax, %edi
+    cmpl $500000, %edi
+    jbe Lsleep
+    movl $500000, %edi
+Lsleep:
+    callq _pf_usleep
+    jmp Lclock
+Ldeadline_due:
+    movq %rax, %rdx
+    subq %rcx, %rdx
+    cmpq %rbx, %rdx
+    jae Lready // discard missed deadlines instead of accumulating a backlog
+    movq %rcx, %rax
+Lready:
+    movq %rax, _pf_present_state(%rip)
+Lpresent_call:
+    movq -16(%rbp), %rdi
+    movq -24(%rbp), %rsi
+    callq _pf_vk_present
+    addq $0x38, %rsp
+    popq %rbx
+    popq %rbp
+    retq
+Lpresent_direct:
+    jmp _pf_vk_present

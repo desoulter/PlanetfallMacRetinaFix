@@ -204,11 +204,16 @@ __attribute__((constructor)) static void initialize(void) {
    if(slash){snprintf(fallback,sizeof fallback,"%.*s/game_display_trace.log",(int)(slash-ownImage.dli_fname),ownImage.dli_fname);path=fallback;}}
  }
  if(!path)return;output=fopen(path,"w");started=now();
- trace("Planetfall display trace v1.0.0; observational hooks only; main-image symbols can use ASLR addresses");
+ trace("Planetfall display trace v1.1.0; observational hooks only; main-image symbols can use ASLR addresses");
  trace("IMAGE mainSlide=0x%llx",(unsigned long long)_dyld_get_image_vmaddr_slide(0));
  if(gameImage){const uint32_t sites[2]={0xec18e4,0xec1ad9};unsigned covered=0;
   for(unsigned i=0;i<2;i++){unsigned char *code=(unsigned char *)(gameImage+sites[i]);int32_t rel;memcpy(&rel,code+1,4);
    if(code[0]==0xe8&&(int64_t)sites[i]+5+rel==0x7000)++covered;}
   trace("PATCH eventPollCoverage=%u/2",covered);
+  const unsigned char *config=(const unsigned char *)(gameImage+0x7d00);
+  if(!memcmp(config,"PFCONF11",8)){uint32_t w,h;uint64_t interval;
+   memcpy(&w,config+8,4);memcpy(&h,config+12,4);memcpy(&interval,config+16,8);
+   trace("PATCH configuredRender=%ux%u pacingIntervalNs=%llu",w,h,(unsigned long long)interval);
+  }
  }
 }
